@@ -166,6 +166,7 @@ let running = false, startT = -1;
 let rpm = 0, speed = 0, gear = 1, throttle = 0, prevThrottle = 0, boost = 0;
 let padT = 0, keyT = 0, cut = 0, shiftCut = 0;
 let gpsSpeed = null, gpsAccel = 0, gpsWatch = null, gpsLast = null, gpsFixAt = 0;
+let liveAccel = 0, shiftCool = 0, overrunT = 0, crackT = 0, blip = 0;
 let calib = 0; // % added to GPS speed to match the car's speedometer
 try { calib = parseFloat(localStorage.getItem('calib')) || 0; } catch (e) {}
 let volume = .7;
@@ -249,7 +250,10 @@ function buildAudio() {
   const turbo = ctx.createOscillator(), tg = ctx.createGain();
   turbo.type = 'sine'; tg.gain.value = 0; turbo.connect(tg).connect(bus); turbo.start();
 
-  A = { master, bus, am, lp, o1, o2, o3, lfo, lfoG, nbp, ng, turbo, tg, noise };
+  // one-shot effects (bangs, shifts) bypass the engine bus so they stay loud off-throttle
+  const fx = ctx.createGain(); fx.gain.value = .9; fx.connect(master);
+
+  A = { master, bus, fx, am, lp, o1, o2, o3, lfo, lfoG, nbp, ng, turbo, tg, noise };
   applyEngine();
 }
 function applyEngine() {
@@ -266,15 +270,31 @@ function burst(when, freq, dur, level, hp) {
   g.gain.setValueAtTime(0, when);
   g.gain.linearRampToValueAtTime(level, when + .004);
   g.gain.exponentialRampToValueAtTime(.0001, when + dur);
-  s.connect(f).connect(g).connect(A.bus);
+  s.connect(f).connect(g).connect(A.fx);
   s.start(when, Math.random() * 1.5, dur + .05);
+}
+function thump(when, freq, level, dur) {
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(freq, when);
+  o.frequency.exponentialRampToValueAtTime(freq * .5, when + dur);
+  g.gain.setValueAtTime(0, when);
+  g.gain.linearRampToValueAtTime(level, when + .005);
+  g.gain.exponentialRampToValueAtTime(.0001, when + dur);
+  o.connect(g).connect(A.fx); o.start(when); o.stop(when + dur + .05);
+}
+const click = (when, level) => burst(when, 3000, .02, level, true);
+// one exhaust "bang": mid-band crack, low body, sharp edge
+function bang(when, level) {
+  const l = level * (.7 + Math.random() * .5);
+  burst(when, 500 + Math.random() * 700, .07 + Math.random() * .06, l);
+  thump(when, 90 + Math.random() * 40, l * .8, .09);
+  click(when, l * .5);
 }
 function liftOff() {
   const t = ctx.currentTime;
-  const n = Math.round(3 + eng.crackle * 10 * (rpm / eng.red));
-  for (let i = 0; i < n; i++) {
-    burst(t + .08 + Math.random() * 1.1 * eng.crackle + .1, 900 + Math.random() * 1800, .03 + Math.random() * .05, .35 + Math.random() * .5);
-  }
+  const n = Math.round(2 + eng.crackle * 6 * (rpm / eng.red + .3));
+  for (let i = 0; i < n; i++) bang(t + .06 + Math.random() * .9 * (.4 + eng.crackle), .5 + Math.random() * .4);
   if (eng.turbo && boost > .4) burst(t + .02, 2500, .45, .25 * boost * eng.turbo, true);
 }
 function updateAudio(eff) {
@@ -328,8 +348,8 @@ function physics(dt) {
   let eff = (cut > 0 || shiftCut > 0) ? 0 : throttle;
   boost += ((eff > .3 ? eff : 0) - boost) * dt * (eff > boost ? 1.6 : 4);
 
-  if (prevThrottle > .55 && eff < .25 && rpm > eng.red * .4) liftOff();
-  prevThrottle = eff;
+  if (prevThrottle > .55 && throttle < .25 && rpm > eng.red * .35) liftOff();
+  prevThrottle = throttle;
 
   if (mode === 'rev') {
     gear = 0;
@@ -339,36 +359,74 @@ function physics(dt) {
     return eff;
   }
 
+  const prevSpeed = speed;
   if (mode === 'drive') {
     if (gear < 1) gear = 1;
-    const ratio = GEARS[gear - 1];
-    const a = eff * 11 * ratio - (.8 + .00035 * speed * speed);
+    const a = eff * 11 * GEARS[gear - 1] - (.8 + .00035 * speed * speed);
     speed = Math.max(0, speed + a * dt);
   } else {
     // between 1 Hz fixes, project forward with the last measured acceleration
     const since = Math.min(1.2, (performance.now() - gpsFixAt) / 1000);
     const pred = gpsSpeed == null ? 0 : Math.max(0, gpsSpeed + gpsAccel * since);
     speed += (pred * (1 + calib / 100) - speed) * Math.min(1, dt * 4);
-    const want = eff > .5 ? 3200 : 1600;
-    gear = 1;
-    for (let g = 6; g >= 1; g--) if (speed * GEARS[g - 1] * K >= want) { gear = g; break; }
+  }
+  liveAccel += ((speed - prevSpeed) / Math.max(dt, .001) - liveAccel) * Math.min(1, dt * 5);
+
+  shiftCool = Math.max(0, shiftCool - dt);
+  if (gear < 1) gear = 1;
+  const rAt = g => speed * GEARS[g - 1] * K;
+  if (shiftCool === 0) {
+    if (mode === 'drive') {
+      if (rpm > eng.red * .97 && gear < 6) shift(1);
+      else if (gear > 1 && rAt(gear - 1) < eng.red * .75 && rpm < 1700) shift(-1);
+    } else {
+      // harder acceleration holds each gear longer, like a real gearbox
+      const upAt = 2200 + throttle * (eng.red * .82 - 2200);
+      if (speed < 4) gear = 1;
+      else if (gear < 6 && rAt(gear) > upAt) shift(1);
+      else if (gear > 1 && (rAt(gear) < 1300 || (liveAccel < -3 && rAt(gear - 1) < eng.red * .55 && rAt(gear) < 2000))) shift(-1);
+    }
   }
 
-  const ratio = GEARS[gear - 1];
-  let target = Math.max(eng.idle, speed * ratio * K);
+  blip = Math.max(0, blip - dt * 1500);
+  let target = Math.max(eng.idle, rAt(gear)) + blip;
   if (speed < 18) target = Math.max(target, eng.idle + eff * 2400);
   rpm += (target - rpm) * Math.min(1, dt * 8);
+  if (rpm > eng.red) { rpm = eng.red - 200; cut = .06; }
 
-  if (mode === 'drive') {
-    if (rpm > eng.red * .97 && gear < 6) { gear++; shiftCut = .14; }
-    else if (rpm > eng.red) { rpm = eng.red - 200; cut = .06; }
-    if (gear > 1 && speed * GEARS[gear - 2] * K < eng.red * .75 && rpm < 1700) gear--;
+  // overrun: off throttle while slowing keeps popping, fading after a few seconds
+  const overrun = throttle < .2 && liveAccel < -2 && rpm > 1800;
+  overrunT = overrun ? overrunT + dt : 0;
+  if (overrun && A) {
+    crackT -= dt;
+    if (crackT <= 0) {
+      const fade = Math.max(.25, 1 - overrunT / 4);
+      bang(ctx.currentTime, (.4 + Math.min(1, -liveAccel / 10) * .6) * fade);
+      crackT = (.06 + Math.random() * .3) / (eng.crackle * fade + .2);
+    }
   }
   return eff;
 }
 
+function shift(dir) {
+  gear += dir; shiftCool = .6;
+  if (!A) return;
+  const t = ctx.currentTime;
+  if (dir > 0) {
+    shiftCut = .12;
+    click(t + .01, .35);
+    thump(t + .02, 70, .5, .1);
+    if (eng.turbo && boost > .3) burst(t + .03, 2500, .35, .2 * boost * eng.turbo, true);
+  } else {
+    blip = 450; // rev-match
+    thump(t, 80, .4, .08);
+    if (Math.random() < .5 + eng.crackle * .5) bang(t + .12 + Math.random() * .1, .7);
+  }
+}
+
 // ---------- GPS ----------
-function gpsThrottle() { return gpsSpeed == null ? 0 : clamp(gpsAccel / 7, 0, 1) * .9 + (gpsSpeed > 5 ? .12 : 0); }
+// throttle follows how fast speed is rising: even gentle acceleration opens it up
+function gpsThrottle() { return gpsSpeed == null ? 0 : Math.max(gpsSpeed > 5 ? .12 : 0, Math.sqrt(clamp(liveAccel / 10, 0, 1))); }
 function startGps() {
   if (!navigator.geolocation) { status('이 브라우저는 위치를 지원하지 않아요'); return; }
   status('GPS 신호를 찾는 중…');
