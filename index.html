@@ -185,7 +185,7 @@ for (const [k, e] of Object.entries(ENGINES)) {
   b.onclick = () => {
     engKey = k; eng = e;
     engWrap.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', x === b));
-    if (A) applyEngine();
+    if (A?.ready) applyEngine();
   };
   engWrap.appendChild(b);
 }
@@ -276,12 +276,14 @@ async function makeExhaust(c, voicing) {
   await c.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' })));
   const wk = new AudioWorkletNode(c, 'exhaust', { numberOfInputs: 0, outputChannelCount: [1], processorOptions: voicing });
   const eq = (type, freq, gain, Q) => { const f = c.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.gain.value = gain; f.Q.value = Q; return f; };
-  const out = eq('lowpass', 7500, 0, .5);
-  wk.connect(eq('lowshelf', 110, 7, .8)).connect(eq('peaking', 1100, -6, 1)).connect(eq('highshelf', 3500, 2, .8)).connect(out);
+  const out = c.createGain(); out.gain.value = 1.6;
+  wk.connect(eq('lowshelf', 110, 7, .8)).connect(eq('peaking', 1100, -6, 1)).connect(eq('highshelf', 3500, 2, .8)).connect(eq('lowpass', 7500, 0, .5)).connect(out);
   return { wk, out };
 }
+const withTimeout = (pr, ms) => Promise.race([pr, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 async function buildAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)();
+  ctx.resume().catch(() => {}); // still inside the tap, before any await
   const comp = ctx.createDynamicsCompressor();
   comp.threshold.value = -10; comp.ratio.value = 3; comp.knee.value = 6;
   comp.attack.value = .005; comp.release.value = .15;
@@ -293,9 +295,11 @@ async function buildAudio() {
   const noise = makeNoise();
   A = { master, bus, fx, noise };
 
+  // some browsers lack AudioWorklet or hang loading it: fall back to the oscillator voice
   try {
-    const ex = await makeExhaust(ctx, VOICING[engKey]);
+    const ex = await withTimeout(makeExhaust(ctx, VOICING[engKey]), 2500);
     ex.out.connect(bus); A.wk = ex.wk;
+    ex.wk.onprocessorerror = () => { ex.out.disconnect(); A.wk = null; buildOscChain(); applyEngine(); status(`${eng.name} 시동 · 기본 엔진`); };
   } catch (e) { buildOscChain(); }
 
   const ns = ctx.createBufferSource(); ns.buffer = noise; ns.loop = true;
@@ -306,6 +310,7 @@ async function buildAudio() {
   A.turbo = ctx.createOscillator(); A.tg = ctx.createGain();
   A.turbo.type = 'sine'; A.tg.gain.value = 0; A.turbo.connect(A.tg).connect(bus); A.turbo.start();
   applyEngine();
+  A.ready = true; // the frame loop only drives audio once every node exists
 }
 // fallback for browsers without AudioWorklet: the older oscillator voice
 function buildOscChain() {
@@ -398,7 +403,7 @@ async function startEngine() {
   running = true; startT = 0; rpm = 0;
   $('start').setAttribute('aria-pressed', 'true');
   $('start').innerHTML = 'ENGINE<br>STOP';
-  status(`${eng.name} 시동`);
+  status(`${eng.name} 시동 · ${A.wk ? '펄스 엔진' : '기본 엔진'}`);
   try { navigator.wakeLock?.request('screen').catch(() => {}); } catch (e) {}
 }
 function stopEngine() {
@@ -592,7 +597,7 @@ let last = performance.now();
 function frame(now) {
   const dt = Math.min(.05, (now - last) / 1000); last = now;
   const eff = physics(dt);
-  if (A) updateAudio(eff);
+  if (A?.ready) updateAudio(eff);
   pedal.style.setProperty('--t', throttle.toFixed(3));
   $('tval').textContent = Math.round(throttle * 100) + '%';
   pedal.setAttribute('aria-valuenow', Math.round(throttle * 100));
