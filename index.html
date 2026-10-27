@@ -216,51 +216,122 @@ function makeNoise() {
   for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
   return buf;
 }
-function buildAudio() {
+// Exhaust synthesis runs per sample in an AudioWorklet: every cylinder firing launches a
+// short pressure pulse (sharp attack, low body, a little rasp). Summed, the pulses give the
+// punchy low end a real exhaust has instead of a filtered buzz.
+const WORKLET = `
+class Exhaust extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [{ name: 'rpm', defaultValue: 0 }, { name: 'throttle', defaultValue: 0 }];
+  }
+  constructor(opts) {
+    super();
+    this.cfg = Object.assign({ cyl: 8, body: 80, uneven: .1, pattern: [1], rasp: .5 }, opts.processorOptions || {});
+    this.acc = 0; this.idx = 0; this.next = 1; this.voices = [];
+    this.dc = 0; this.dcPrev = 0;
+    this.port.onmessage = e => Object.assign(this.cfg, e.data);
+  }
+  process(_, outputs, params) {
+    const out = outputs[0][0], c = this.cfg, dt = 1 / sampleRate;
+    const rpm = params.rpm[0], thr = params.throttle[0];
+    const fireHz = rpm / 60 * c.cyl / 2;
+    const decay = Math.max(90, fireHz * 1.6);
+    const amp = .35 + .65 * thr;
+    for (let i = 0; i < out.length; i++) {
+      this.acc += fireHz * dt;
+      if (rpm > 50 && this.acc >= this.next) {
+        this.acc -= this.next;
+        this.idx = (this.idx + 1) % c.cyl;
+        const p = c.pattern[this.idx % c.pattern.length];
+        // uneven spacing between pulses is what makes a cross-plane V8 burble
+        this.next = 1 + (p - .8) * c.uneven * 2 + (Math.random() - .5) * .04;
+        if (this.voices.length < 48) this.voices.push({ t: 0, a: amp * p * (.9 + Math.random() * .2), f: c.body * (.95 + Math.random() * .1) });
+      }
+      let s = 0;
+      for (let v = this.voices.length - 1; v >= 0; v--) {
+        const vo = this.voices[v];
+        const env = Math.exp(-vo.t * decay);
+        if (env < .002) { this.voices.splice(v, 1); continue; }
+        const att = Math.min(1, vo.t * 4000);
+        s += vo.a * att * env * (Math.sin(6.2832 * vo.f * vo.t) + .6)
+           + vo.a * env * env * c.rasp * thr * (Math.random() * 2 - 1);
+        vo.t += dt;
+      }
+      const y = s - this.dcPrev + .995 * this.dc; this.dcPrev = s; this.dc = y;
+      out[i] = Math.tanh(y * 1.4);
+    }
+    return true;
+  }
+}
+registerProcessor('exhaust', Exhaust);
+`;
+const VOICING = {
+  v8:  { cyl: 8,  body: 72,  uneven: .14, pattern: [1, .72, .92, .62, 1, .78, .86, .66], rasp: .35 },
+  v12: { cyl: 12, body: 140, uneven: .02, pattern: [1, .95, 1, .97, .98, .96], rasp: .6 },
+  i6:  { cyl: 6,  body: 105, uneven: .03, pattern: [1, .9, .95, 1, .9, .95], rasp: .5 },
+  f4:  { cyl: 4,  body: 92,  uneven: .06, pattern: [1, .8, .95, .75], rasp: .8 },
+};
+// worklet engine followed by EQ: push the low end, scoop the nasal mids
+async function makeExhaust(c, voicing) {
+  await c.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' })));
+  const wk = new AudioWorkletNode(c, 'exhaust', { numberOfInputs: 0, outputChannelCount: [1], processorOptions: voicing });
+  const eq = (type, freq, gain, Q) => { const f = c.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.gain.value = gain; f.Q.value = Q; return f; };
+  const out = eq('lowpass', 7500, 0, .5);
+  wk.connect(eq('lowshelf', 110, 7, .8)).connect(eq('peaking', 1100, -6, 1)).connect(eq('highshelf', 3500, 2, .8)).connect(out);
+  return { wk, out };
+}
+async function buildAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)();
   const comp = ctx.createDynamicsCompressor();
-  comp.threshold.value = -14; comp.ratio.value = 4;
+  comp.threshold.value = -10; comp.ratio.value = 3; comp.knee.value = 6;
+  comp.attack.value = .005; comp.release.value = .15;
   comp.connect(ctx.destination);
   const master = ctx.createGain(); master.gain.value = volume; master.connect(comp);
   const bus = ctx.createGain(); bus.gain.value = 0; bus.connect(master);
+  // one-shot effects (bangs, shifts) bypass the engine bus so they stay loud off-throttle
+  const fx = ctx.createGain(); fx.gain.value = .9; fx.connect(master);
+  const noise = makeNoise();
+  A = { master, bus, fx, noise };
 
-  const am = ctx.createGain(); am.gain.value = .7; am.connect(bus);
-  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 1.2; lp.connect(am);
+  try {
+    const ex = await makeExhaust(ctx, VOICING[engKey]);
+    ex.out.connect(bus); A.wk = ex.wk;
+  } catch (e) { buildOscChain(); }
+
+  const ns = ctx.createBufferSource(); ns.buffer = noise; ns.loop = true;
+  A.nbp = ctx.createBiquadFilter(); A.nbp.type = 'bandpass'; A.nbp.Q.value = .7;
+  A.ng = ctx.createGain(); A.ng.gain.value = 0;
+  ns.connect(A.nbp).connect(A.ng).connect(bus); ns.start();
+
+  A.turbo = ctx.createOscillator(); A.tg = ctx.createGain();
+  A.turbo.type = 'sine'; A.tg.gain.value = 0; A.turbo.connect(A.tg).connect(bus); A.turbo.start();
+  applyEngine();
+}
+// fallback for browsers without AudioWorklet: the older oscillator voice
+function buildOscChain() {
+  A.am = ctx.createGain(); A.am.gain.value = .7; A.am.connect(A.bus);
+  A.lp = ctx.createBiquadFilter(); A.lp.type = 'lowpass'; A.lp.Q.value = 1.2; A.lp.connect(A.am);
   const shaper = ctx.createWaveShaper();
   const curve = new Float32Array(1024);
   for (let i = 0; i < 1024; i++) { const x = i / 512 - 1; curve[i] = Math.tanh(x * 3.2); }
-  shaper.curve = curve; shaper.connect(lp);
-
+  shaper.curve = curve; shaper.connect(A.lp);
   const osc = (type, gain) => {
     const o = ctx.createOscillator(), g = ctx.createGain();
     o.type = type; g.gain.value = gain; o.connect(g).connect(shaper); o.start();
     return { o, g };
   };
-  const o1 = osc('sawtooth', .5), o2 = osc('square', .3), o3 = osc('sawtooth', .12);
-
-  const lfo = ctx.createOscillator(), lfoG = ctx.createGain();
-  lfo.type = 'sine'; lfo.connect(lfoG).connect(am.gain); lfo.start();
-
-  const noise = makeNoise();
-  const ns = ctx.createBufferSource(); ns.buffer = noise; ns.loop = true;
-  const nbp = ctx.createBiquadFilter(); nbp.type = 'bandpass'; nbp.Q.value = .7;
-  const ng = ctx.createGain(); ng.gain.value = 0;
-  ns.connect(nbp).connect(ng).connect(bus); ns.start();
-
-  const turbo = ctx.createOscillator(), tg = ctx.createGain();
-  turbo.type = 'sine'; tg.gain.value = 0; turbo.connect(tg).connect(bus); turbo.start();
-
-  // one-shot effects (bangs, shifts) bypass the engine bus so they stay loud off-throttle
-  const fx = ctx.createGain(); fx.gain.value = .9; fx.connect(master);
-
-  A = { master, bus, fx, am, lp, o1, o2, o3, lfo, lfoG, nbp, ng, turbo, tg, noise };
-  applyEngine();
+  A.o1 = osc('sawtooth', .5); A.o2 = osc('square', .3); A.o3 = osc('sawtooth', .12);
+  A.lfo = ctx.createOscillator(); A.lfoG = ctx.createGain();
+  A.lfo.type = 'sine'; A.lfo.connect(A.lfoG).connect(A.am.gain); A.lfo.start();
 }
 function applyEngine() {
   const t = ctx.currentTime;
-  A.o2.g.gain.setTargetAtTime(.08 + eng.burble * .5, t, .05);
-  A.lfoG.gain.setTargetAtTime(eng.burble * .35, t, .05);
-  A.am.gain.setTargetAtTime(.75 - eng.burble * .2, t, .05);
+  if (A.wk) A.wk.port.postMessage(VOICING[engKey]);
+  else {
+    A.o2.g.gain.setTargetAtTime(.08 + eng.burble * .5, t, .05);
+    A.lfoG.gain.setTargetAtTime(eng.burble * .35, t, .05);
+    A.am.gain.setTargetAtTime(.75 - eng.burble * .2, t, .05);
+  }
   if (!eng.turbo) A.tg.gain.setTargetAtTime(0, t, .05);
 }
 function burst(when, freq, dur, level, hp) {
@@ -301,13 +372,18 @@ function updateAudio(eff) {
   const t = ctx.currentTime, r = Math.max(rpm, 60);
   const f = r / 60 * eng.cyl / 2;
   const load = .3 + eff * .55 + (rpm / eng.red) * .2;
-  A.o1.o.frequency.setTargetAtTime(f, t, .015);
-  A.o2.o.frequency.setTargetAtTime(f / 2, t, .015);
-  A.o3.o.frequency.setTargetAtTime(f * 2.01, t, .015);
-  A.lfo.frequency.setTargetAtTime(r / 120, t, .03);
-  A.lp.frequency.setTargetAtTime(250 + f * eng.bright * (1.6 + eff * 5), t, .03);
+  if (A.wk) {
+    A.wk.parameters.get('rpm').setTargetAtTime(running ? r : 0, t, .015);
+    A.wk.parameters.get('throttle').setTargetAtTime(eff, t, .03);
+  } else {
+    A.o1.o.frequency.setTargetAtTime(f, t, .015);
+    A.o2.o.frequency.setTargetAtTime(f / 2, t, .015);
+    A.o3.o.frequency.setTargetAtTime(f * 2.01, t, .015);
+    A.lfo.frequency.setTargetAtTime(r / 120, t, .03);
+    A.lp.frequency.setTargetAtTime(250 + f * eng.bright * (1.6 + eff * 5), t, .03);
+  }
   A.nbp.frequency.setTargetAtTime(f * 3.5, t, .03);
-  A.ng.gain.setTargetAtTime(.05 + eff * .22 * (rpm / eng.red + .3), t, .03);
+  A.ng.gain.setTargetAtTime((.05 + eff * .22 * (rpm / eng.red + .3)) * (A.wk ? .35 : 1), t, .03);
   A.bus.gain.setTargetAtTime(running ? load : 0, t, running ? .04 : .5);
   if (eng.turbo) {
     A.turbo.frequency.setTargetAtTime(1800 + rpm * .7 * boost, t, .08);
@@ -317,7 +393,7 @@ function updateAudio(eff) {
 
 // ---------- Engine ----------
 async function startEngine() {
-  if (!ctx) buildAudio();
+  if (!ctx) await buildAudio();
   try { await ctx.resume(); } catch (e) {}
   running = true; startT = 0; rpm = 0;
   $('start').setAttribute('aria-pressed', 'true');
