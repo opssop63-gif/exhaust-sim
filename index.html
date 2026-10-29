@@ -229,7 +229,7 @@ class Exhaust extends AudioWorkletProcessor {
   }
   constructor(opts) {
     super();
-    this.cfg = Object.assign({ cyl: 8, body: 80, uneven: .1, pattern: [1], rasp: .5, gain: 1 }, opts.processorOptions || {});
+    this.cfg = Object.assign({ cyl: 8, body: 80, uneven: .1, pattern: [1], rasp: .5, gain: 1, ring: 1, sub: 0 }, opts.processorOptions || {});
     this.acc = 0; this.idx = 0; this.next = 1; this.voices = [];
     this.dc = 0; this.dcPrev = 0;
     this.port.onmessage = e => Object.assign(this.cfg, e.data);
@@ -238,7 +238,7 @@ class Exhaust extends AudioWorkletProcessor {
     const out = outputs[0][0], c = this.cfg, dt = 1 / sampleRate;
     const rpm = params.rpm[0], thr = params.throttle[0];
     const fireHz = rpm / 60 * c.cyl / 2;
-    const decay = Math.max(90, fireHz * 1.6);
+    const decay = Math.max(90, fireHz * 1.6) / c.ring; // ring > 1 lets each pulse boom longer
     const amp = .35 + .65 * thr;
     for (let i = 0; i < out.length; i++) {
       this.acc += fireHz * dt;
@@ -256,7 +256,7 @@ class Exhaust extends AudioWorkletProcessor {
         const env = Math.exp(-vo.t * decay);
         if (env < .002) { this.voices.splice(v, 1); continue; }
         const att = Math.min(1, vo.t * 4000);
-        s += vo.a * att * env * (Math.sin(6.2832 * vo.f * vo.t) + .6)
+        s += vo.a * att * env * (Math.sin(6.2832 * vo.f * vo.t) + .6 + c.sub * Math.sin(3.1416 * vo.f * vo.t))
            + vo.a * env * env * c.rasp * thr * (Math.random() * 2 - 1);
         vo.t += dt;
       }
@@ -273,8 +273,8 @@ const VOICING = {
   v12: { cyl: 12, body: 140, uneven: .02, pattern: [1, .95, 1, .97, .98, .96], rasp: .6 },
   i6:  { cyl: 6,  body: 105, uneven: .03, pattern: [1, .9, .95, 1, .9, .95], rasp: .5 },
   f4:  { cyl: 4,  body: 92,  uneven: .06, pattern: [1, .8, .95, .75], rasp: .8 },
-  // Performante twin-turbo V8: the lowest, lumpiest voice here, a bull-like rumble pushed a bit louder
-  urus: { cyl: 8, body: 50, uneven: .24, pattern: [1, .6, .9, .52, 1, .66, .84, .56], rasp: .4, gain: 1.3 },
+  // Performante twin-turbo V8: the lowest, lumpiest voice here, a bull-like rumble with a sub-octave boom
+  urus: { cyl: 8, body: 46, uneven: .24, pattern: [1, .6, .9, .52, 1, .66, .84, .56], rasp: .35, gain: 1.45, ring: 1.7, sub: .7 },
 };
 // worklet engine followed by EQ: push the low end, scoop the nasal mids
 async function makeExhaust(c, voicing) {
@@ -338,7 +338,7 @@ function buildOscChain() {
 }
 function applyEngine() {
   const t = ctx.currentTime;
-  if (A.wk) A.wk.port.postMessage({ gain: 1, ...VOICING[engKey] });
+  if (A.wk) A.wk.port.postMessage({ gain: 1, ring: 1, sub: 0, ...VOICING[engKey] });
   else {
     A.o2.g.gain.setTargetAtTime(.08 + eng.burble * .5, t, .05);
     A.lfoG.gain.setTargetAtTime(eng.burble * .35, t, .05);
