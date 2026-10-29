@@ -483,8 +483,9 @@ function physics(dt) {
       else if (gear > 1 && rAt(gear - 1) < eng.red * .75 && rpm < 1700) shift(-1);
     } else {
       // shift early and often: a Tesla pulls hard on a light foot, so even full acceleration
-      // only holds each gear to mid revs and all six gears go by before about 110 km/h
-      const upAt = 2000 + throttle * throttle * (Math.min(4000, eng.red * .55) - 2000);
+      // only holds each gear to mid revs: all six gears go by between 0 and about 95 km/h
+      // (hard: 29/43/59/76/95 km/h, gentle: 17/26/36/46/57 km/h)
+      const upAt = 2000 + throttle * throttle * 1300;
       if (speed < 4) gear = 1;
       else if (gear < 6 && liveAccel > -1 && rAt(gear) > upAt) shift(1); // never upshift while slowing
       else if (gear > 1 && (rAt(gear) < 1300 || (liveAccel < -3 && rAt(gear - 1) < eng.red * .6 && rAt(gear) < 2200))) shift(-1);
