@@ -288,13 +288,13 @@ async function buildAudio() {
   // iPhone: play through the ringer/silent switch like a music app
   try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
   const comp = ctx.createDynamicsCompressor();
-  comp.threshold.value = -10; comp.ratio.value = 3; comp.knee.value = 6;
+  comp.threshold.value = -8; comp.ratio.value = 3; comp.knee.value = 6;
   comp.attack.value = .005; comp.release.value = .15;
   comp.connect(ctx.destination);
   const master = ctx.createGain(); master.gain.value = volume; master.connect(comp);
   const bus = ctx.createGain(); bus.gain.value = 0; bus.connect(master);
   // one-shot effects (bangs, shifts) bypass the engine bus so they stay loud off-throttle
-  const fx = ctx.createGain(); fx.gain.value = .9; fx.connect(master);
+  const fx = ctx.createGain(); fx.gain.value = 1.6; fx.connect(master);
   const noise = makeNoise();
   A = { master, bus, fx, noise };
 
@@ -379,7 +379,10 @@ function liftOff() {
 function updateAudio(eff) {
   const t = ctx.currentTime, r = Math.max(rpm, 60);
   const f = r / 60 * eng.cyl / 2;
-  const load = .3 + eff * .55 + (rpm / eng.red) * .2;
+  // loudness follows road speed more than pedal: a Tesla cruises at 100 km/h on a light foot,
+  // so town speeds stay quiet and highway cruising fills the cabin
+  const road = mode === 'rev' ? 1 : .55 + .8 * clamp(speed / 100, 0, 1.15);
+  const load = (.45 + eff * .3 + (rpm / eng.red) * .15) * road;
   if (A.wk) {
     A.wk.parameters.get('rpm').setTargetAtTime(running ? r : 0, t, .015);
     A.wk.parameters.get('throttle').setTargetAtTime(eff, t, .03);
